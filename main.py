@@ -5,7 +5,7 @@ import yt_dlp
 import os
 import uuid
 
-app = FastAPI(title="Telegram-Bot Style Video Downloader")
+app = FastAPI(title="Anti-Bot Telegram-Style Downloader")
 
 app.add_middleware(
     CORSMiddleware,
@@ -16,63 +16,71 @@ app.add_middleware(
 )
 
 def remove_file(path: str):
-    """Удаляет файл с сервера после успешной отправки в Android"""
     if os.path.exists(path):
         try:
             os.remove(path)
-        except Exception as e:
-            print(f"Error removing temporary file: {e}")
+        except Exception:
+            pass
 
 @app.get("/download")
 def download_video(url: str, background_tasks: BackgroundTasks):
     if not url:
         raise HTTPException(status_code=400, detail="URL matches empty string")
 
-    # Генерируем уникальное случайное имя файла на сервере
     unique_id = str(uuid.uuid4())[:8]
-    output_template = f"/tmp/downloaded_video_{unique_id}.%(ext)s"
+    output_template = f"/tmp/video_{unique_id}.%(ext)s"
 
+    # СЕКРЕТНЫЕ НАСТРОЙКИ ДЛЯ ОБХОДА БЛОКИРОВОК ИМЕННО НА ХОСТИНГАХ:
     ydl_opts = {
-        # Скачиваем лучшее mp4 видео со звуком воедино
+        # Заставляем запрашивать форматы mp4
         'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
         'outtmpl': output_template,
         'quiet': True,
         'no_warnings': True,
+        
+        # Маскируемся под мобильный клиент Android/IOS. 
+        # Это заставляет YouTube и Instagram думать, что запрос идет из официального приложения!
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android', 'ios'],
+                'skip': ['webpage']
+            },
+            'instagram': {
+                'apps': ['android']
+            }
+        },
+        
+        # Эмулируем реальный мобильный трафик
         'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Sec-Fetch-Mode': 'navigate'
         }
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # 1. Сервер сам скачивает видео к себе на диск (как Телеграм Бот)
             info = ydl.extract_info(url, download=True)
-            
-            # Получаем реальное название видео для отправки в Android
             video_title = info.get('title', f"video_{unique_id}")
             safe_title = "".join([c for c in video_title if c.isalpha() or c.isdigit() or c in (' ', '_', '-')]).strip()
             if not safe_title:
                 safe_title = "downloaded_video"
 
-            # Находим скачанный файл на диске сервера
             actual_filename = ydl.prepare_filename(info)
             
-            # На бесплатных хостингах расширение может измениться, проверяем физический файл
+            # Проверяем расширения на диске сервера
             if not os.path.exists(actual_filename):
-                # Если yt-dlp сохранил с другим расширением, ищем его в папке /tmp/
-                base_path = f"/tmp/downloaded_video_{unique_id}"
                 for f in os.listdir("/tmp"):
-                    if f.startswith(f"downloaded_video_{unique_id}"):
+                    if f.startswith(f"video_{unique_id}"):
                         actual_filename = os.path.join("/tmp", f)
                         break
 
             if not os.path.exists(actual_filename):
-                raise HTTPException(status_code=404, detail="Файл не скачался на сервер")
+                raise HTTPException(status_code=404, detail="Файл не найден на диске сервера")
 
-            # 2. Добавляем фоновую задачу на удаление файла ПОСЛЕ того, как Android его скачает
             background_tasks.add_task(remove_file, actual_filename)
 
-            # 3. Отправляем готовый чистый физический файл в Android-приложение!
             return FileResponse(
                 path=actual_filename,
                 media_type="video/mp4",
@@ -80,13 +88,38 @@ def download_video(url: str, background_tasks: BackgroundTasks):
             )
 
     except Exception as e:
-        # В случае ошибки очищаем диск
-        base_path = f"/tmp/downloaded_video_{unique_id}"
-        for ext in ['.mp4', '.mkv', '.webm', '.part']:
-            if os.path.exists(base_path + ext):
-                remove_file(base_path + ext)
-        raise HTTPException(status_code=500, detail=str(e))
+        # Если yt-dlp заблокирован по IP окончательно, применяем Резервный Мобильный Шлюз Публичного Парсинга
+        # прямо внутри сервера Render, чтобы спасти загрузку!
+        return download_via_server_fallback(url, safe_title=f"video_{unique_id}", background_tasks=background_tasks)
+
+def download_via_server_fallback(url: str, safe_title: str, background_tasks: BackgroundTasks):
+    """Резервный метод парсинга внутри сервера, если yt-dlp забанен по IP дата-центра"""
+    import requests
+    try:
+        # Делаем запрос к открытому API Cobalt
+        payload = {"url": url, "vQuality": "720", "isAudioOnly": False}
+        headers = {"Accept": "application/json", "Content-Type": "application/json"}
+        
+        res = requests.post("https://api.cobalt.tools/api/json", json=payload, headers=headers, timeout=15)
+        if res.status_code == 200:
+            direct_url = res.json().get("url")
+            if direct_url:
+                tmp_path = f"/tmp/{safe_title}.mp4"
+                
+                # Скачиваем файл на сервер Render
+                video_res = requests.get(direct_url, stream=True, timeout=30)
+                with open(tmp_path, 'wb') as f:
+                    for chunk in video_res.iter_content(chunk_size=1024*1024):
+                        if chunk:
+                            f.write(chunk)
+                            
+                background_tasks.add_task(remove_file, tmp_path)
+                return FileResponse(path=tmp_path, media_type="video/mp4", filename=f"{safe_title}.mp4")
+                
+        raise Exception("Все методы скачивания на сервере исчерпаны")
+    except Exception as err:
+        raise HTTPException(status_code=500, detail=f"Ошибка скачивания: {str(err)}")
 
 @app.get("/")
 def root():
-    return {"status": "Бот-сервер работает в режиме прямого скачивания файлов!"}
+    return {"status": "Анти-бан сервер загрузок активен!"}
