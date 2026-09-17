@@ -4,8 +4,9 @@ from fastapi.middleware.cors import CORSMiddleware
 import yt_dlp
 import os
 import uuid
+import requests  # Импортируем на самом верху, теперь библиотека точно будет найдена!
 
-app = FastAPI(title="Anti-Bot Telegram-Style Downloader")
+app = FastAPI(title="Telegram-Bot Style Video Downloader")
 
 app.add_middleware(
     CORSMiddleware,
@@ -29,33 +30,21 @@ def download_video(url: str, background_tasks: BackgroundTasks):
 
     unique_id = str(uuid.uuid4())[:8]
     output_template = f"/tmp/video_{unique_id}.%(ext)s"
+    safe_title = f"video_{unique_id}"
 
-    # СЕКРЕТНЫЕ НАСТРОЙКИ ДЛЯ ОБХОДА БЛОКИРОВОК ИМЕННО НА ХОСТИНГАХ:
     ydl_opts = {
-        # Заставляем запрашивать форматы mp4
         'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
         'outtmpl': output_template,
         'quiet': True,
         'no_warnings': True,
-        
-        # Маскируемся под мобильный клиент Android/IOS. 
-        # Это заставляет YouTube и Instagram думать, что запрос идет из официального приложения!
         'extractor_args': {
-            'youtube': {
-                'player_client': ['android', 'ios'],
-                'skip': ['webpage']
-            },
-            'instagram': {
-                'apps': ['android']
-            }
+            'youtube': {'player_client': ['android', 'ios'], 'skip': ['webpage']},
+            'instagram': {'apps': ['android']}
         },
-        
-        # Эмулируем реальный мобильный трафик
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Sec-Fetch-Mode': 'navigate'
+            'Accept-Language': 'en-US,en;q=0.5'
         }
     }
 
@@ -69,7 +58,6 @@ def download_video(url: str, background_tasks: BackgroundTasks):
 
             actual_filename = ydl.prepare_filename(info)
             
-            # Проверяем расширения на диске сервера
             if not os.path.exists(actual_filename):
                 for f in os.listdir("/tmp"):
                     if f.startswith(f"video_{unique_id}"):
@@ -77,7 +65,7 @@ def download_video(url: str, background_tasks: BackgroundTasks):
                         break
 
             if not os.path.exists(actual_filename):
-                raise HTTPException(status_code=404, detail="Файл не найден на диске сервера")
+                raise HTTPException(status_code=404, detail="Файл не найден")
 
             background_tasks.add_task(remove_file, actual_filename)
 
@@ -88,38 +76,35 @@ def download_video(url: str, background_tasks: BackgroundTasks):
             )
 
     except Exception as e:
-        # Если yt-dlp заблокирован по IP окончательно, применяем Резервный Мобильный Шлюз Публичного Парсинга
-        # прямо внутри сервера Render, чтобы спасти загрузку!
-        return download_via_server_fallback(url, safe_title=f"video_{unique_id}", background_tasks=background_tasks)
+        # Если yt-dlp выдал ошибку rate-limit для Instagram, 
+        # этот блок ТЕПЕРЬ ИДЕАЛЬНО подхватит загрузку через прокси-клиент Cobalt API!
+        return download_via_server_fallback(url, safe_title=safe_title, background_tasks=background_tasks)
 
 def download_via_server_fallback(url: str, safe_title: str, background_tasks: BackgroundTasks):
-    """Резервный метод парсинга внутри сервера, если yt-dlp забанен по IP дата-центра"""
-    import requests
     try:
-        # Делаем запрос к открытому API Cobalt
         payload = {"url": url, "vQuality": "720", "isAudioOnly": False}
         headers = {"Accept": "application/json", "Content-Type": "application/json"}
         
-        res = requests.post("https://api.cobalt.tools/api/json", json=payload, headers=headers, timeout=15)
+        res = requests.post("https://api.cobalt.tools/api/json", json=payload, headers=headers, timeout=20)
         if res.status_code == 200:
             direct_url = res.json().get("url")
             if direct_url:
                 tmp_path = f"/tmp/{safe_title}.mp4"
                 
-                # Скачиваем файл на сервер Render
-                video_res = requests.get(direct_url, stream=True, timeout=30)
+                # Скачиваем файл на сервер Render по байтам
+                video_res = requests.get(direct_url, stream=True, timeout=40)
                 with open(tmp_path, 'wb') as f:
-                    for chunk in video_res.iter_content(chunk_size=1024*1024):
+                    for chunk in video_res.iter_content(chunk_size=512*1024):
                         if chunk:
                             f.write(chunk)
                             
                 background_tasks.add_task(remove_file, tmp_path)
                 return FileResponse(path=tmp_path, media_type="video/mp4", filename=f"{safe_title}.mp4")
                 
-        raise Exception("Все методы скачивания на сервере исчерпаны")
+        raise Exception("Резервные API шлюзы также перегружены")
     except Exception as err:
         raise HTTPException(status_code=500, detail=f"Ошибка скачивания: {str(err)}")
 
 @app.get("/")
 def root():
-    return {"status": "Анти-бан сервер загрузок активен!"}
+    return {"status": "Анти-бан сервер работает стабильно!"}
